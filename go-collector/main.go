@@ -107,10 +107,7 @@ func collector(readings chan<- EquipmentReading, done <-chan struct{}, interval 
 				go func(cfg EquipmentConfig) {
 					defer wg.Done()
 					reading := simulateReading(cfg)
-					select {
-					case readings <- reading:
-					case <-done:
-					}
+					readings <- reading
 				}(eq)
 			}
 			wg.Wait()
@@ -120,7 +117,12 @@ func collector(readings chan<- EquipmentReading, done <-chan struct{}, interval 
 	}
 }
 
-func batchWriter(readings <-chan EquipmentReading, done <-chan struct{}, wg *sync.WaitGroup, batchSize int, timeout time.Duration, filename string) {
+func collectorLoop(readings chan<- EquipmentReading, done <-chan struct{}, wg *sync.WaitGroup, interval time.Duration) {
+	defer wg.Done()
+	collector(readings, done, interval)
+}
+
+func batchWriter(readings <-chan EquipmentReading, wg *sync.WaitGroup, batchSize int, timeout time.Duration, filename string) {
 	defer wg.Done()
 
 	batch := make([]EquipmentReading, 0, batchSize)
@@ -161,17 +163,6 @@ func batchWriter(readings <-chan EquipmentReading, done <-chan struct{}, wg *syn
 
 		case <-timer.C:
 			flush()
-
-		case <-done:
-			select {
-			case r, ok := <-readings:
-				if ok {
-					batch = append(batch, r)
-				}
-			default:
-			}
-			flush()
-			return
 		}
 	}
 }
@@ -188,10 +179,13 @@ func main() {
 	readingsCh := make(chan EquipmentReading, channelBuffer)
 	doneCh := make(chan struct{})
 
+	var collectorWg sync.WaitGroup
+	collectorWg.Add(1)
+	go collectorLoop(readingsCh, doneCh, &collectorWg, pollInterval)
+
 	var writerWg sync.WaitGroup
 	writerWg.Add(1)
-	go batchWriter(readingsCh, doneCh, &writerWg, batchSize, batchTimeout, outputFile)
-	go collector(readingsCh, doneCh, pollInterval)
+	go batchWriter(readingsCh, &writerWg, batchSize, batchTimeout, outputFile)
 
 	log.Println("Starting Modbus/OPC emulation collector with batch writer")
 	log.Printf("Equipment: %d, Poll interval: %v, Batch size: %d, Batch timeout: %v, Channel buffer: %d",
@@ -203,6 +197,9 @@ func main() {
 
 	log.Println("Shutting down...")
 	close(doneCh)
+	collectorWg.Wait()
+	log.Println("Collector stopped, draining remaining data...")
+	close(readingsCh)
 	writerWg.Wait()
 	log.Println("Shutdown complete")
 }
